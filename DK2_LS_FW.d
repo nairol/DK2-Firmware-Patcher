@@ -13,9 +13,18 @@ import std.stdio : writeln, writefln;
 import std.file : exists, read, write;
 import std.conv : parse;
 import std.typecons : tuple;
-import std.bitmanip : littleEndianToNative;
+import std.bitmanip : littleEndianToNative, nativeToLittleEndian;
 import std.digest.crc : CRC32;
 import std.path : stripExtension;
+import std.algorithm : any;
+import std.math: abs;
+
+enum fileHeaderLength = 23;
+enum imageHeaderLength = 10;
+enum firmwareFileOffset = fileHeaderLength + imageHeaderLength;
+
+enum baseAddressFlash = 0x08004000;
+enum defaultLensSeparation = 63500;
 
 void main( string[] args )
 {
@@ -26,18 +35,12 @@ void main( string[] args )
 		return;
 	}
 	
-	uint lensSeperation = args[1].parse!uint;
-	if( lensSeperation > ushort.max )
-	{
-		writeln("Lens separation too big (max. 65535)");
-		return;
-	}
-	ushort newValue = lensSeperation & ushort.max;
+	auto lensSeparation = args[1].parse!uint;
 	
 	string firmwarePath = args[2];
 	if( firmwarePath.exists() == false )
 	{
-		writeln("Firmware path incorrect");
+		writeln("Error: Firmware path incorrect");
 		return;
 	}
 	
@@ -45,33 +48,34 @@ void main( string[] args )
 	auto buf = cast(ubyte[]) firmwarePath.read();
 	
 	// Very simple check. I should do more validation with the data in the header...
-	if( buf[0..4] != [0x4F, 0x56, 0x52, 0x46] )
+	if( buf[0..4] != ['O', 'V', 'R', 'F'] )
 	{
-		writeln("This is not a valid Oculus firmware file.");
+		writeln("Error: This is not a valid Oculus firmware file.");
 		return;
 	}
 	
-	// This assumes that there is only one firmware image in the file and that the first one is the
+	// This assumes that there is only one firmware image in the file and that it is for the DK2
 	auto firmwareLength = buf[0x1D .. 0x21].littleEndianToNative!uint;
-	if( firmwareLength + 33 > buf.length )
+	if( firmwareLength + firmwareFileOffset > buf.length )
 	{
-		writeln("Image size in header wrong or file incomplete!");
+		writeln("Error: Image size in header wrong or file incomplete!");
 		return;
 	}
 	
+	// Get the slice of the file that only contains the firmware image
 	auto fw = buf[0x21 .. 0x21+firmwareLength];
 	
-	writeln("Searching the default value...");
+	writeln("Searching the default lens separation value in the file...");
 	
-	auto offsets = fw.findOffsetsForMOVimm16( 63500 );
+	auto offsets = fw.findOffsetsFor_MOV_imm_T3( defaultLensSeparation );
 	if( offsets.length == 0 )
 	{
-		writeln("Could not find the default lens separation value in the firmware!");
+		writeln("Error: Could not find the default lens separation value in the firmware!");
 		return;
 	}
 	if( offsets.length > 1 )
 	{
-		writeln("Found more than one possible addresses to patch:");
+		writeln("Error: Found more than one possible addresses to patch:");
 		foreach( offset; offsets )
 		{
 			writefln( "0x%.8X", offset );
@@ -79,21 +83,86 @@ void main( string[] args )
 		return;
 	}
 	
-	auto offset = offsets[0];
-	auto mov = fw[offset..offset+4].decodeMOVimm16();
-	writefln("Found default value at address 0x%.8X (register=%d)", offsets[0], mov.register);
+	auto originalOffset = offsets[0];
+	auto mov = fw[originalOffset..originalOffset+4].decode_MOV_imm_T3();
+	writefln("Found at file offset 0x%.8X (address 0x%.8X): MOVW R%d, #%d",
+	         firmwareFileOffset+originalOffset, baseAddressFlash+originalOffset,
+	         mov.register, mov.value);
 	
-	writefln("Changing lens separation value to %d (0x%.4X)", newValue, newValue);
-	fw[offset..offset+4] = encodeMOVimm16(mov.register, newValue);
+	writeln();
+	writeln("Checking if there is free space for the detour function...");
+	if( fw[$-256..$].any() )
+	{
+		writefln("Error: There is data or code in the last 256 bytes! Too risky to patch.");
+		return;
+	}
+	writeln("The last 256 bytes contain only zeros. They are assumed to be free space.");
+	writeln();
+	writefln("Changing lens separation to %d micrometers (0x%.8X)...", lensSeparation, lensSeparation);
+	writeln();
+	writeln("The following changes have been made:");
+	writeln();
+	writeln("File Offset | Address  | Data        | Decoded Data");
+	writeln("------------+----------+-------------+------------------");
 	
-	writeln("Recalculating CRC32...");
+	auto detourFuncOffset = fw.length - 12; // Detour function will be in the last 12 bytes of flash
+	auto detourFuncAddress = baseAddressFlash + detourFuncOffset;
+	
+	// Replace the 32 bit MOV instruction with a unconditional branch (jump) to the detour
+	//  function that will be written later to the very top of flash memory.
+	auto branchForwardDifference = detourFuncOffset - (originalOffset+4);
+	auto branchForwardInstruction = encode_B_T4( branchForwardDifference );
+	fw[originalOffset..originalOffset+4] = branchForwardInstruction[];
+	writefln(" %.8X   | %.8X | %.4X %.4X   | B.W %.8X",
+	         firmwareFileOffset+originalOffset,
+	         baseAddressFlash+originalOffset,
+	         branchForwardInstruction[0..2].littleEndianToNative!ushort,
+	         branchForwardInstruction[2..4].littleEndianToNative!ushort,
+	         detourFuncAddress);
+	
+	// First detour function instruction: Load the 32 bit lens separation value
+	// The parameter addressDifference (4) means that the data is loaded from (PC+4).
+	// PC (program counter) is the address of the next instruction.
+	auto detourFunc = fw[detourFuncOffset .. $]; // Get a slice of the last 12 bytes of flash memory
+	detourFunc[0..4] = encode_LDR_literal_T2( mov.register, 4); // Instr: Load word from (here + 8)
+	writefln(" %.8X   | %.8X | %.4X %.4X   | LDR.W R%d, [PC,#%d]",
+	         firmwareFileOffset+detourFuncOffset,
+	         detourFuncAddress,
+	         detourFunc[0..2].littleEndianToNative!ushort,
+	         detourFunc[2..4].littleEndianToNative!ushort,
+	         mov.register, 4);
+	
+	// Second detour function instruction: Branch (jump) back into the original function
+	// Destination is the next instruction after the MOV (that has been replaced by our branch)
+	auto branchBackDifference = (originalOffset+4) - (detourFuncOffset+8);
+	detourFunc[4..8] = encode_B_T4( branchBackDifference ); // Instr: Jump to next original instruction
+	writefln(" %.8X   | %.8X | %.4X %.4X   | B.W %.8X",
+	         firmwareFileOffset+detourFuncOffset+4,
+	         detourFuncAddress+4,
+	         detourFunc[4..6].littleEndianToNative!ushort,
+	         detourFunc[6..8].littleEndianToNative!ushort,
+	         baseAddressFlash+originalOffset+4);
+	
+	// Lens separation value, 32 bit, unsigned(?), little-endian (LSB first)
+	// This will be loaded by the first detour function instruction
+	detourFunc[8..12] = lensSeparation.nativeToLittleEndian;
+	writefln(" %.8X   | %.8X | %.8X    | Lens separation value: %d",
+	         firmwareFileOffset+detourFuncOffset+8,
+	         detourFuncAddress+8,
+	         detourFunc[8..12].littleEndianToNative!uint,
+	         detourFunc[8..12].littleEndianToNative!uint);
+	
+	// Update the firmware header + image CRC32 value
 	CRC32 crc;
 	crc.put( buf[0x1B..0x21+firmwareLength] );
 	auto crcResult = crc.finish();
 	buf[0x17..0x1B] = crcResult;
-	writefln("New CRC32 is %(%.2X%)", crcResult);
+	writefln(" %.8X   |   n/a    | %.2X %.2X %.2X %.2X | New firmware CRC32 value",
+	         0x17, buf[0x17], buf[0x18], buf[0x19], buf[0x1A]);
 	
-	string newFile = firmwarePath.stripExtension() ~ "_Fixed_Lens_Seperation.ovrf";
+	writeln();
+	
+	string newFile = firmwarePath.stripExtension() ~ ".patched.ovrf";
 	writeln("Writing patched firmware image to ", newFile);
 	write(newFile, buf);
 	
@@ -105,7 +174,7 @@ void main( string[] args )
 	writeln();
 }
 
-bool isMOVimm16( const ubyte[] instruction )
+bool is_MOV_imm_T3( const ubyte[] instruction )
 {
 	// See https://web.eecs.umich.edu/~prabal/teaching/eecs373-f11/readings/ARMv7-M_ARM.pdf (p. 347)
 	return ((instruction[0] & 0b11110000) == 0b01000000) &&
@@ -113,23 +182,7 @@ bool isMOVimm16( const ubyte[] instruction )
 	       ((instruction[3] & 0b10000000) == 0b00000000);
 }
 
-ubyte[4] encodeMOVimm16( ubyte register, ushort value )
-{
-	// See https://web.eecs.umich.edu/~prabal/teaching/eecs373-f11/readings/ARMv7-M_ARM.pdf (p. 347)
-	auto imm4 = (0b1111000000000000 & value) >> 12;
-	auto i    = (0b0000100000000000 & value) >> 11;
-	auto imm3 = (0b0000011100000000 & value) >>  8;
-	auto imm8 = (0b0000000011111111 & value);
-	
-	ubyte[4] result;
-	result[0] = 0xFF & (0b01000000 | imm4);
-	result[1] = 0xFF & (0b11110010 | (i << 2));
-	result[2] = 0xFF & imm8;
-	result[3] = 0xFF & ((imm3 << 4) | (register & 0b00001111));
-	return result;
-}
-
-auto decodeMOVimm16( const ubyte[] instruction )
+auto decode_MOV_imm_T3( const ubyte[] instruction )
 {
 	// See https://web.eecs.umich.edu/~prabal/teaching/eecs373-f11/readings/ARMv7-M_ARM.pdf (p. 347)
 	auto imm4 = (0b00001111 & instruction[0]);
@@ -142,10 +195,9 @@ auto decodeMOVimm16( const ubyte[] instruction )
 	return tuple!("register", "value")(reg, val);
 }
 
-
 // Find all offsets of MOV instructions with given 16-bit immediate operand
 // Assumes the buffer is a firmware image and the image starts at a 2 byte aligned target address
-uint[] findOffsetsForMOVimm16( const ubyte[] buffer, ushort operand )
+uint[] findOffsetsFor_MOV_imm_T3( const ubyte[] buffer, ushort operand )
 {
 	uint[] results = [];
 	
@@ -153,9 +205,9 @@ uint[] findOffsetsForMOVimm16( const ubyte[] buffer, ushort operand )
 	{
 		auto slice = buffer[offset .. offset+4];
 		
-		if( slice.isMOVimm16() )
+		if( slice.is_MOV_imm_T3() )
 		{
-			auto mov = decodeMOVimm16( slice );
+			auto mov = decode_MOV_imm_T3( slice );
 			if( mov.value == operand )
 			{
 				results.length = results.length + 1;
@@ -164,4 +216,63 @@ uint[] findOffsetsForMOVimm16( const ubyte[] buffer, ushort operand )
 		}
 	}
 	return results;
+}
+
+ubyte[4] encode_B_T4( int addressDifference )
+{
+	// See https://web.eecs.umich.edu/~prabal/teaching/eecs373-f11/readings/ARMv7-M_ARM.pdf (p. 239)
+	if( addressDifference % 2 != 0 )
+	{
+		throw new Exception("encode_B_T4: Address difference LSB set! (Instruction or target unaligned)");
+	}
+	enum MIN = -(2^^24)  ; // -16777216
+	enum MAX =  (2^^24)-1; //  16777215
+	
+	if( addressDifference > MAX || addressDifference < MIN )
+	{
+		throw new Exception("encode_B_T4: Address difference too big to encode in T4!");
+	}
+	
+	auto imm24 = cast(uint) addressDifference;
+	imm24 = (imm24 >> 1) & 0x00FFFFFF;
+	
+	auto S     = (0b10000000_00000000_00000000 & imm24) >> 23;
+	auto I1    = (0b01000000_00000000_00000000 & imm24) >> 22;
+	auto I2    = (0b00100000_00000000_00000000 & imm24) >> 21;
+	auto imm10 = (0b00011111_11111000_00000000 & imm24) >> 11;
+	auto imm11 = (0b00000000_00000111_11111111 & imm24);
+	
+	auto J1 = ~(I1 ^ S) & 0b00000001;
+	auto J2 = ~(I2 ^ S) & 0b00000001;
+	
+	ubyte[4] result;
+	result[0] = 0xFF & imm10;
+	result[1] = 0xFF & (0b11110000 | (S << 2) | (imm10 >> 8));
+	result[2] = 0xFF & imm11;
+	result[3] = 0xFF & (0b10010000 | (J1 << 5) | (J2 << 3) | (imm11 >> 8));
+	
+	return result;
+}
+
+ubyte[4] encode_LDR_literal_T2( ubyte register, short addressDifference )
+{
+	// See https://web.eecs.umich.edu/~prabal/teaching/eecs373-f11/readings/ARMv7-M_ARM.pdf (p. 289)
+	if( register > 0b1111 )
+	{
+		throw new Exception("encode_LDR_literal_T2: register invalid");
+	}
+	
+	auto offset = abs( addressDifference );
+	if( offset > 0xFFF )
+	{
+		throw new Exception("encode_LDR_literal_T2: addressDifference too big (max = +-4095)");
+	}
+	
+	ubyte[4] result;
+	result[0] = (addressDifference >= 0) ? 0b11011111 : 0b01011111;
+	result[1] = 0b11111000;
+	result[2] = 0xFF & offset;
+	result[3] = 0xFF & (( register << 4) | (offset >> 8));
+	
+	return result;
 }
