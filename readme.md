@@ -13,7 +13,7 @@ If you just want to change the lens separation value in the original DK2 firmwar
     DK2_LS_FW <Lens separation value in micrometers> <Path to firmware file>
 
 ## Command line arguments for DK2_LS_FW2_12:  
-    DK2_LS_FW [Lens separation value in micrometers]  
+    DK2_LS_FW2_12 [Lens separation value in micrometers]  
 If you don't specify the lens separation on the command line, the program will ask for it.  
 The program must be in the same directory as *DK2Firmware_2_12.ovrf*.
 
