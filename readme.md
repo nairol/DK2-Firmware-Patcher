@@ -1,5 +1,15 @@
 # Lens Separation Adjuster for DK2 Firmware
 
+---
+
+**Patching the firmware is no longer required. Oculus have added support for overriding the lens seperation distance to the official Runtime. [More information here.](https://www.reddit.com/r/oculus/comments/3dugxj/thank_you_oculus_sdk_0601_now_supports_lens/)**
+
+---
+
+---
+
+---
+
 **I do NOT own a DK2 and have NOT tested the firmware files that this program produces. Use at your own risk!**  
 I **have** checked firmware files produced by this tool in a disassembler and they look good.
 
